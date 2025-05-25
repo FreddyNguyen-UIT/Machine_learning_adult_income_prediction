@@ -6,7 +6,6 @@ from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_sc
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.svm import SVC
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
@@ -171,31 +170,9 @@ def train_gradient_boosting(X_train, y_train):
     model = Pipeline([
         ('preprocessor', preprocessor),
         ('classifier', GradientBoostingClassifier(
-            n_estimators=100,
+            n_estimators=10,
             learning_rate=0.1,
             max_depth=3,
-            random_state=0
-        ))
-    ])
-    
-    model.fit(X_train, y_train)
-    return model
-
-def train_svm(X_train, y_train):
-    """Train Support Vector Machine model"""
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('num', StandardScaler(), list(range(X_train.shape[1])))
-        ],
-        remainder='passthrough'
-    )
-    
-    model = Pipeline([
-        ('preprocessor', preprocessor),
-        ('classifier', SVC(
-            kernel='rbf',
-            class_weight='balanced',
-            probability=True,
             random_state=0
         ))
     ])
@@ -258,7 +235,6 @@ def get_model_metrics(X, y, test_size=0.3, random_state=42):
         'Random Forest': lambda: train_random_forest(X_train, y_train),
         'XGBoost': lambda: train_xgboost(X_train, y_train, X_val, y_val),
         'Gradient Boosting': lambda: train_gradient_boosting(X_train, y_train),
-        'SVM': lambda: train_svm(X_train, y_train),
         'Naive Bayes': lambda: train_naive_bayes(X_train, y_train),
         'K-Nearest Neighbors': lambda: train_knn(X_train, y_train)
     }
@@ -314,7 +290,7 @@ def prediction_mode(X, y, feature_names, feature_info):
     
     # Model selection
     st.subheader("Select Model")
-    available_models = ["Logistic Regression", "XGBoost", "Random Forest", "Gradient Boosting", "SVM", "Naive Bayes", "K-Nearest Neighbors"]
+    available_models = ["Logistic Regression", "XGBoost", "Random Forest", "Gradient Boosting", "Naive Bayes", "K-Nearest Neighbors"]
     selected_model = st.selectbox("Choose a model for prediction:", available_models)
     
     # Train selected model for prediction
@@ -334,8 +310,6 @@ def prediction_mode(X, y, feature_names, feature_info):
                 model = train_random_forest(X_train_split, y_train_split)
             elif selected_model == "Gradient Boosting":
                 model = train_gradient_boosting(X_train_split, y_train_split)
-            elif selected_model == "SVM":
-                model = train_svm(X_train_split, y_train_split)
             elif selected_model == "Naive Bayes":
                 model = train_naive_bayes(X_train_split, y_train_split)
             elif selected_model == "K-Nearest Neighbors":
