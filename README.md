@@ -23,12 +23,11 @@ A comprehensive web application for predicting adult income levels using three d
 
 1. **Install Dependencies:**
    ```bash
-   pip install -r requirements.txt
+   pip install -r constraints.txt
    ```
 
 2. **Prepare Files:**
    - Ensure `adult.csv` is in the same directory
-   - Keep your model files (`LogisticRegression.py`, `XGBoost.py`, `RandomForest.py`) in the same directory
 
 3. **Run the Application:**
    ```bash
