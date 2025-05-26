@@ -1,144 +1,113 @@
 import numpy as np
 from numba import jit, prange
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, log_loss
-import pandas as pd
+from sklearn.metrics import log_loss
 
-# Standalone sigmoid function for Numba
 @jit(nopython=True)
 def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
+    return 1 / (1 + np.exp(-np.clip(x, -250, 250)))
 
-# Histogram-based split finding with Numba
 @jit(nopython=True, parallel=True)
 def find_histogram_split(x, gradient, hessian, min_leaf, min_child_weight, lambda_, gamma, max_bins=256):
     n = len(x)
     if n < 2 * min_leaf:
-        return -np.inf, 0, 0
+        return -np.inf, 0
     
-    # Bin feature values
     x_min, x_max = x.min(), x.max()
     if x_min == x_max:
-        return -np.inf, 0, 0
+        return -np.inf, 0
     
-    bin_edges = np.linspace(x_min, x_max, max_bins + 1)
+    bin_width = (x_max - x_min) / max_bins
     hist_gradient = np.zeros(max_bins)
     hist_hessian = np.zeros(max_bins)
     
-    # Compute histograms
     for i in prange(n):
-        bin_idx = min(int((x[i] - x_min) / (x_max - x_min + 1e-10) * max_bins), max_bins - 1)
+        bin_idx = min(int((x[i] - x_min) / bin_width), max_bins - 1)
         hist_gradient[bin_idx] += gradient[i]
         hist_hessian[bin_idx] += hessian[i]
     
-    # Evaluate splits
-    best_score = -np.inf
-    best_split = 0
-    left_gradient = 0
-    left_hessian = 0
-    total_gradient = hist_gradient.sum()
-    total_hessian = hist_hessian.sum()
+    best_score, best_split = -np.inf, 0
+    left_grad, left_hess = 0, 0
+    total_grad, total_hess = hist_gradient.sum(), hist_hessian.sum()
     
     for i in range(max_bins - 1):
-        left_gradient += hist_gradient[i]
-        left_hessian += hist_hessian[i]
-        right_gradient = total_gradient - left_gradient
-        right_hessian = total_hessian - left_hessian
+        left_grad += hist_gradient[i]
+        left_hess += hist_hessian[i]
+        right_grad, right_hess = total_grad - left_grad, total_hess - left_hess
         
-        if (left_hessian < min_child_weight or right_hessian < min_child_weight or
-            left_hessian < min_leaf or right_hessian < min_leaf):
+        if min(left_hess, right_hess) < max(min_child_weight, min_leaf):
             continue
         
-        gain = 0.5 * (
-            (left_gradient**2 / (left_hessian + lambda_)) +
-            (right_gradient**2 / (right_hessian + lambda_)) -
-            ((left_gradient + right_gradient)**2 / (left_hessian + right_hessian + lambda_))
-        ) - gamma
+        gain = 0.5 * (left_grad**2 / (left_hess + lambda_) + 
+                     right_grad**2 / (right_hess + lambda_) - 
+                     total_grad**2 / (total_hess + lambda_)) - gamma
         
         if gain > best_score:
-            best_score = gain
-            best_split = bin_edges[i + 1]
+            best_score, best_split = gain, x_min + (i + 1) * bin_width
     
-    return best_score, best_split, max_bins
+    return best_score, best_split
 
 class Node:
-    def __init__(self, x, gradient, hessian, idxs, subsample_cols=1.0, min_leaf=5, min_child_weight=1, depth=6, lambda_=1, gamma=0):
-        self.x = x
-        self.gradient = gradient
-        self.hessian = hessian
-        self.idxs = idxs
-        self.depth = depth
-        self.min_leaf = min_leaf
-        self.lambda_ = lambda_
-        self.gamma = gamma
-        self.min_child_weight = min_child_weight
-        self.row_count = len(idxs)
-        self.col_count = x.shape[1]
-        self.subsample_cols = subsample_cols
-        self.column_subsample = np.random.permutation(self.col_count)[:round(self.subsample_cols * self.col_count)]
+    def __init__(self, x, gradient, hessian, idxs, **params):
+        self.x, self.gradient, self.hessian, self.idxs = x, gradient, hessian, idxs
+        self.depth = params.get('depth', 6)
+        self.min_leaf = params.get('min_leaf', 5)
+        self.lambda_ = params.get('lambda_', 1)
+        self.gamma = params.get('gamma', 0)
+        self.min_child_weight = params.get('min_child_weight', 1)
+        self.subsample_cols = params.get('subsample_cols', 1.0)
         
-        self.val = -np.sum(gradient[idxs]) / (np.sum(hessian[idxs]) + lambda_)
-        self.score = -np.inf
-        self.var_idx = 0
-        self.split = 0
-        self.find_varsplit()
+        self.val = -np.sum(gradient[idxs]) / (np.sum(hessian[idxs]) + self.lambda_)
+        self.score, self.var_idx, self.split = -np.inf, 0, 0
+        
+        col_count = x.shape[1]
+        self.column_subsample = np.random.choice(col_count, 
+                                               int(self.subsample_cols * col_count), 
+                                               replace=False)
+        self._find_split()
     
-    def find_varsplit(self):
-        # Parallelize feature evaluation with Numba
-        scores = np.full(self.col_count, -np.inf)
-        splits = np.zeros(self.col_count)
-        for c in self.column_subsample:
-            x_col = self.x[self.idxs, c]
-            score, split, _ = find_histogram_split(
-                x_col, self.gradient[self.idxs], self.hessian[self.idxs],
-                self.min_leaf, self.min_child_weight, self.lambda_, self.gamma
-            )
-            scores[c] = score
-            splits[c] = split
-        
-        best_idx = np.argmax(scores)
-        self.score = scores[best_idx]
-        self.var_idx = best_idx
-        self.split = splits[best_idx]
-        
-        if self.is_leaf:
+    def _find_split(self):
+        if self.depth <= 0 or len(self.idxs) < 2 * self.min_leaf:
             return
         
-        x = self.x[self.idxs, self.var_idx]
-        lhs = np.nonzero(x <= self.split)[0]
-        rhs = np.nonzero(x > self.split)[0]
-        self.lhs = Node(
-            self.x, self.gradient, self.hessian, self.idxs[lhs], self.subsample_cols,
-            self.min_leaf, self.min_child_weight, self.depth - 1, self.lambda_, self.gamma
-        )
-        self.rhs = Node(
-            self.x, self.gradient, self.hessian, self.idxs[rhs], self.subsample_cols,
-            self.min_leaf, self.min_child_weight, self.depth - 1, self.lambda_, self.gamma
-        )
-    
-    @property
-    def split_col(self):
-        return self.x[self.idxs, self.var_idx]
+        best_score, best_var, best_split = -np.inf, 0, 0
+        
+        for c in self.column_subsample:
+            score, split = find_histogram_split(
+                self.x[self.idxs, c], self.gradient[self.idxs], self.hessian[self.idxs],
+                self.min_leaf, self.min_child_weight, self.lambda_, self.gamma
+            )
+            if score > best_score:
+                best_score, best_var, best_split = score, c, split
+        
+        self.score, self.var_idx, self.split = best_score, best_var, best_split
+        
+        if self.score > -np.inf:
+            mask = self.x[self.idxs, self.var_idx] <= self.split
+            lhs_idxs, rhs_idxs = self.idxs[mask], self.idxs[~mask]
+            
+            params = {'depth': self.depth - 1, 'min_leaf': self.min_leaf,
+                     'lambda_': self.lambda_, 'gamma': self.gamma,
+                     'min_child_weight': self.min_child_weight,
+                     'subsample_cols': self.subsample_cols}
+            
+            self.lhs = Node(self.x, self.gradient, self.hessian, lhs_idxs, **params)
+            self.rhs = Node(self.x, self.gradient, self.hessian, rhs_idxs, **params)
     
     @property
     def is_leaf(self):
-        return self.score == -np.inf or self.depth <= 0
+        return self.score == -np.inf
     
-    def predict(self, x):
-        return np.array([self.predict_row(xi) for xi in x])
+    def predict(self, X):
+        return np.array([self._predict_row(xi) for xi in X])
     
-    def predict_row(self, xi):
-        if self.is_leaf:
-            return self.val
-        node = self.lhs if xi[self.var_idx] <= self.split else self.rhs
-        return node.predict_row(xi)
+    def _predict_row(self, xi):
+        return self.val if self.is_leaf else (
+            self.lhs if xi[self.var_idx] <= self.split else self.rhs
+        )._predict_row(xi)
 
 class XGBoostTree:
-    def fit(self, x, gradient, hessian, subsample_cols=1.0, min_leaf=5, min_child_weight=1, depth=6, lambda_=1, gamma=0):
-        self.dtree = Node(
-            x, gradient, hessian, np.arange(len(x)), subsample_cols, min_leaf,
-            min_child_weight, depth, lambda_, gamma
-        )
+    def fit(self, x, gradient, hessian, **params):
+        self.dtree = Node(x, gradient, hessian, np.arange(len(x)), **params)
         return self
     
     def predict(self, X):
@@ -150,73 +119,50 @@ class XGBoostClassifier:
     
     @staticmethod
     @jit(nopython=True)
-    def grad(preds, labels):
-        preds = sigmoid(preds)
-        return preds - labels
+    def _grad_hess(preds, labels):
+        probs = sigmoid(preds)
+        return probs - labels, probs * (1 - probs)
     
-    @staticmethod
-    @jit(nopython=True)
-    def hess(preds, labels):
-        preds = sigmoid(preds)
-        return preds * (1 - preds)
-    
-    def fit(self, X, y, X_val=None, y_val=None, subsample_cols=1.0, min_child_weight=1, depth=6, min_leaf=5, learning_rate=0.05, boosting_rounds=500, lambda_=1, gamma=0, early_stopping_rounds=None, random_state=0):
-        np.random.seed(random_state)  # Set seed for reproducibility
-        self.X, self.y = X, y
-        self.depth = depth
-        self.subsample_cols = subsample_cols
-        self.min_child_weight = min_child_weight
-        self.min_leaf = min_leaf
+    def fit(self, X, y, X_val=None, y_val=None, subsample_cols=1.0, min_child_weight=1, 
+            depth=6, min_leaf=5, learning_rate=0.05, boosting_rounds=500, lambda_=1, 
+            gamma=0, early_stopping_rounds=None, random_state=0):
+        
+        np.random.seed(random_state)
         self.learning_rate = learning_rate
-        self.boosting_rounds = boosting_rounds
-        self.lambda_ = lambda_
-        self.gamma = gamma
-        self.early_stopping_rounds = early_stopping_rounds
         
-        # Initialize base prediction (base_score=0.5 corresponds to logit 0)
-        self.base_pred = np.full((X.shape[0],), 0.0)
-        self.estimators = []
+        pred = np.zeros(X.shape[0])
+        val_pred = np.zeros(X_val.shape[0]) if X_val is not None else None
+        best_loss, best_round = np.inf, 0
         
-        # Early stopping setup
-        best_loss = np.inf
-        best_round = 0
-        if X_val is not None and y_val is not None and early_stopping_rounds:
-            val_pred = np.full((X_val.shape[0],), 0.0)
+        tree_params = {'depth': depth, 'min_leaf': min_leaf, 'lambda_': lambda_,
+                      'gamma': gamma, 'min_child_weight': min_child_weight,
+                      'subsample_cols': subsample_cols}
         
-        # Sequential tree construction
-        for i in range(self.boosting_rounds):
-            Grad = self.grad(self.base_pred, y)
-            Hess = self.hess(self.base_pred, y)
-            tree = XGBoostTree().fit(
-                X, Grad, Hess, depth=depth, min_leaf=min_leaf, lambda_=lambda_,
-                gamma=gamma, min_child_weight=min_child_weight, subsample_cols=subsample_cols
-            )
-            self.base_pred += self.learning_rate * tree.predict(X)
+        for i in range(boosting_rounds):
+            grad, hess = self._grad_hess(pred, y)
+            tree = XGBoostTree().fit(X, grad, hess, **tree_params)
+            pred += learning_rate * tree.predict(X)
             self.estimators.append(tree)
             
-            # Early stopping check
-            if X_val is not None and y_val is not None and early_stopping_rounds:
-                val_pred += self.learning_rate * tree.predict(X_val)
-                val_proba = sigmoid(val_pred)
-                current_loss = log_loss(y_val, val_proba)
+            # Early stopping
+            if val_pred is not None and early_stopping_rounds:
+                val_pred += learning_rate * tree.predict(X_val)
+                current_loss = log_loss(y_val, sigmoid(val_pred))
+                
                 if current_loss < best_loss:
-                    best_loss = current_loss
-                    best_round = i
+                    best_loss, best_round = current_loss, i
                 elif i - best_round >= early_stopping_rounds:
                     print(f"Early stopping at round {i+1}, best loss: {best_loss:.4f}")
                     self.estimators = self.estimators[:best_round + 1]
                     break
+        
+        return self
+    
+    def _predict_raw(self, X):
+        return sum(self.learning_rate * tree.predict(X) for tree in self.estimators)
     
     def predict_proba(self, X):
-        pred = np.zeros(X.shape[0])
-        for estimator in self.estimators:
-            pred += self.learning_rate * estimator.predict(X)
-        return sigmoid(np.full((X.shape[0],), 0.0) + pred)
+        return sigmoid(self._predict_raw(X))
     
     def predict(self, X):
-        pred = np.zeros(X.shape[0])
-        for estimator in self.estimators:
-            pred += self.learning_rate * estimator.predict(X)
-        predicted_probas = sigmoid(np.full((X.shape[0],), 0.0) + pred)
-        return np.where(predicted_probas > 0.5, 1, 0)  # Fixed threshold for binary classification
-
+        return (self.predict_proba(X) > 0.5).astype(int)
